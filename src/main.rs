@@ -1,6 +1,5 @@
 extern crate futures;
 extern crate hyper;
-extern crate slack;
 extern crate tokio_core;
 
 use std::env;
@@ -8,22 +7,16 @@ use std::env;
 use futures::{Future, Stream};
 use hyper::{Client, Uri};
 use hyper::client::HttpConnector;
-use slack::{Event, EventHandler, RtmClient};
-use slack::Event::Message;
-use slack::Message::Standard;
+use hyper::header::ContentLength;
+use hyper::StatusCode;
+use hyper::server::{Http, Request, Response, Service};
 use tokio_core::reactor::Core;
-
-const INSPIRATION_URI: &'static str = "http://inspirobot.me/api?generate=true";
-const API_ENV_VAR: &'static str = "SLACK_API_TOKEN";
 
 #[derive(Debug)]
 struct Muse {
     http_client: Client<HttpConnector>,
     uri: Uri,
 }
-
-#[derive(Debug)]
-struct MuseErr(&'static str);
 
 impl Muse {
     fn new(core: &Core, uri: Uri) -> Self {
@@ -33,7 +26,7 @@ impl Muse {
         }
     }
 
-    fn inspire(&self) -> Box<Future<Item = String, Error = MuseErr>> {
+    fn inspire(&self) -> Box<Future<Item = String, Error = hyper::Error>> {
         let fut = self.http_client
             .get(self.uri.clone())
             .and_then(|response| {
@@ -42,77 +35,53 @@ impl Muse {
                     futures::future::ok::<_, hyper::Error>(acc)
                 })
             })
-            .map(String::from_utf8)
-            .map(|string| string.unwrap_or(String::new()))
-            .map_err(|_| MuseErr("The well's run dry friend!"));
+            .map(|chunks| String::from_utf8(chunks).unwrap_or(String::new()));
 
         Box::new(fut)
     }
 }
 
 #[derive(Debug)]
-struct Inspiration<'a> {
+struct Inspiration {
     muse: Muse,
-    core: &'a mut Core
+    core: Core,
+    valid_tokens: Vec<String>,
 }
 
-impl<'a> Inspiration<'a> {
-    fn new(core: &'a mut Core, uri: Uri) -> Self {
-        Inspiration { muse: Muse::new(core, uri), core: core }
-    }
-
-    fn handle_message(&mut self, client: &RtmClient, message: &slack::Message) {
-        match message {
-            &Standard(ref message) => {
-                match message.channel {
-                    Some(ref ch) => self.send_inspiration(client, ch),
-                    _ => ()
-                }
-            },
-            _ => (),
-        };
-    }
-
-    fn send_inspiration(&mut self, client: &RtmClient, channel: &str) {
-        let fut = self.muse.inspire().map(|response| {
-            client.sender().send_message(channel, &response)
-        });
-
-        self.core.run(fut).unwrap();
+impl Inspiration {
+    fn new(core: Core, uri: Uri, tokens: Vec<String>) -> Self {
+        Inspiration { muse: Muse::new(&core, uri), core: core, valid_tokens: tokens }
     }
 }
 
-#[allow(unused_variables)]
-impl<'a> EventHandler for Inspiration<'a> {
-    fn on_event(&mut self, client: &RtmClient, event: Event) {
-        println!("receieved message: {:?}", event);
-        match event {
-            Message(boxed_message) => self.handle_message(client, boxed_message.as_ref()),
-            _ => (),
-        }
-    }
+impl Service for Inspiration {
+    type Request = Request;
+    type Response = Response;
+    type Error = hyper::Error;
+    type Future = Box<Future<Item=Self::Response, Error=Self::Error>>;
 
-    fn on_close(&mut self, client: &RtmClient) {
-        println!("closed!");
-    }
-
-    fn on_connect(&mut self, client: &RtmClient) {
-        println!("connected");
+    fn call(&self, _req: Request) -> Self::Future {
+        Box::new(
+            self.muse.inspire().map(|message| {
+                Response::new()
+                    .with_header(ContentLength(message.len() as u64))
+                    .with_status(StatusCode::Ok)
+                    .with_body(message)
+            })
+        )
     }
 }
 
 fn main() {
-    let uri = INSPIRATION_URI.parse().unwrap();
-    let api_key = env::var_os(API_ENV_VAR).unwrap();
-    let api_key = api_key.to_str()
-        .map(|s| String::from(s))
-        .unwrap();
-    let mut core = Core::new().unwrap();
-    let mut inspiration = Inspiration::new(&mut core, uri);
-    let client = RtmClient::login_and_run(&api_key, &mut inspiration);
+    let addr = format!("0.0.0.0:{}", env::var("PORT").unwrap()).parse().unwrap();
+    let server = Http::new().bind(&addr, || {
+        let uri = "http://inspirobot.me/api?generate=true".parse().unwrap();
+        let tokens_string = env::var("VALID_TOKENS").unwrap();
+        let valid_tokens = tokens_string.split(':').map(String::from).collect();
+        let core = Core::new().unwrap();
+        let inspiration = Inspiration::new(core, uri, valid_tokens);
+        Ok(inspiration)
+    }).unwrap();
 
-    match client {
-        Err(err) => panic!("Error: {}", err),
-        _ => (),
-    }
+    server.run().unwrap();
 }

@@ -1,6 +1,10 @@
 extern crate futures;
 extern crate hyper;
 extern crate regex;
+extern crate serde;
+extern crate serde_json;
+#[macro_use]
+extern crate serde_derive;
 extern crate tokio_core;
 
 use std::env;
@@ -32,13 +36,11 @@ impl Muse {
     }
 
     fn inspire(&self) -> Box<Future<Item = String, Error = hyper::Error>> {
-        let fut = self.http_client.get(self.uri.clone()).and_then(
+        Box::new(self.http_client.get(self.uri.clone()).and_then(
             |response| {
                 unchunk(response.body())
             },
-        );
-
-        Box::new(fut)
+        ))
     }
 }
 
@@ -83,12 +85,33 @@ impl Responder {
     }
 
     fn respond(&self) -> Box<Future<Item = Response, Error = hyper::Error>> {
-        Box::new(self.muse.inspire().map(|message| {
-            Response::new()
-                .with_header(ContentLength(message.len() as u64))
-                .with_status(StatusCode::Ok)
-                .with_body(message)
-        }))
+        Box::new(
+            self.muse
+                .inspire()
+                .map(|message| {
+                    Response::new()
+                        .with_header(ContentLength(message.len() as u64))
+                        .with_status(StatusCode::Ok)
+                        .with_body(serde_json::to_string(&Message::new(message)).unwrap_or(
+                            String::new(),
+                        ))
+                }),
+        )
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Message {
+    response_type: &'static str,
+    text: String,
+}
+
+impl Message {
+    fn new(message: String) -> Self {
+        Message {
+            response_type: "ephemeral",
+            text: message,
+        }
     }
 }
 
@@ -152,5 +175,7 @@ fn main() {
         Ok(())
     });
 
-    core.run(server).expect("something went terribly wrong with the server");
+    core.run(server).expect(
+        "something went terribly wrong with the server",
+    );
 }

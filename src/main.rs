@@ -4,7 +4,7 @@ extern crate regex;
 extern crate tokio_core;
 
 use std::env;
-use std::cell::RefCell;
+use std::sync::Arc;
 
 use futures::{Future, Stream};
 use futures::future;
@@ -15,6 +15,7 @@ use hyper::StatusCode;
 use hyper::server::{Http, Request, Response, Service};
 use regex::Regex;
 use tokio_core::reactor::Core;
+use tokio_core::net::TcpListener;
 
 #[derive(Debug)]
 struct Muse {
@@ -23,57 +24,82 @@ struct Muse {
 }
 
 impl Muse {
-    fn new(core: &Core, uri: Uri) -> Self {
+    fn new(client: Client<HttpConnector>, uri: Uri) -> Self {
         Muse {
             uri: uri,
-            http_client: Client::new(&core.handle()),
+            http_client: client,
         }
     }
 
     fn inspire(&self) -> Box<Future<Item = String, Error = hyper::Error>> {
-        let fut = self.http_client
-            .get(self.uri.clone())
-            .and_then(|response| {
-                response.body().fold(Vec::new(), |mut acc, chunk| {
-                    acc.extend_from_slice(&*chunk);
-                    futures::future::ok::<_, hyper::Error>(acc)
-                })
-            })
-            .map(|chunks| String::from_utf8(chunks).unwrap_or(String::new()));
+        let fut = self.http_client.get(self.uri.clone()).and_then(
+            |response| {
+                unchunk(response.body())
+            },
+        );
 
         Box::new(fut)
     }
 }
 
 struct Inspiration {
-    muse: Muse,
-    core: RefCell<Core>,
-    valid_tokens: Vec<String>,
+    responder: Arc<Responder>,
+    valid_tokens: Arc<Vec<String>>,
 }
 
 impl Inspiration {
-    fn new(core: Core, uri: Uri, tokens: Vec<String>) -> Self {
+    fn new(responder: Responder, tokens: Vec<String>) -> Self {
         Inspiration {
-            muse: Muse::new(&core, uri),
-            core: RefCell::new(core),
-            valid_tokens: tokens,
+            responder: Arc::new(responder),
+            valid_tokens: Arc::new(tokens),
         }
     }
 
-    fn validate_request(&self, query_string: &str) -> bool {
-        println!("{:?}", query_string);
-        let re = Regex::new(r"token=(.*)&?").expect("Coud not compile token regexp");
-        let result = re.captures(query_string).and_then(|cap| cap.get(1)).map(
-            |m| {
-                println!("{:?}", self.valid_tokens);
-                self.valid_tokens.iter().any(
+    fn validate_request(
+        &self,
+        body: hyper::Body,
+    ) -> Box<Future<Item = bool, Error = hyper::Error>> {
+        let valid_tokens = self.valid_tokens.clone();
+        Box::new(unchunk(body).and_then(move |body_str| {
+            let re = Regex::new(r"token=(.*)&?").expect("Coud not compile token regexp");
+            println!("body string: {}", body_str);
+            let result = re.captures(&*body_str).and_then(|cap| cap.get(1)).map(|m| {
+                valid_tokens.iter().any(
                     |valid| valid.as_str() == m.as_str(),
                 )
-            },
-        );
+            });
 
-        result.unwrap_or(false)
+            future::ok(result.unwrap_or(false))
+        }))
     }
+}
+
+struct Responder {
+    muse: Muse,
+}
+
+impl Responder {
+    fn new(muse: Muse) -> Self {
+        Responder { muse: muse }
+    }
+
+    fn respond(&self) -> Box<Future<Item = Response, Error = hyper::Error>> {
+        Box::new(self.muse.inspire().map(|message| {
+            Response::new()
+                .with_header(ContentLength(message.len() as u64))
+                .with_status(StatusCode::Ok)
+                .with_body(message)
+        }))
+    }
+}
+
+fn unchunk(body: hyper::Body) -> Box<Future<Item = String, Error = hyper::Error>> {
+    Box::new(
+        body.fold(Vec::new(), |mut acc, chunk| {
+            acc.extend_from_slice(&*chunk);
+            futures::future::ok::<_, hyper::Error>(acc)
+        }).map(|chunks| String::from_utf8(chunks).unwrap_or(String::new())),
+    )
 }
 
 impl Service for Inspiration {
@@ -83,50 +109,49 @@ impl Service for Inspiration {
     type Future = Box<Future<Item = Self::Response, Error = Self::Error>>;
 
     fn call(&self, req: Request) -> Self::Future {
-        if self.validate_request(req.query().unwrap_or("")) {
-            match req.method() {
-                &hyper::Method::Post => {
-                    let message = self.core.borrow_mut().run(self.muse.inspire()).unwrap();
-                    println!("got message: {}", message);
-                    Box::new(future::ok(
-                        Response::new()
-                            .with_header(ContentLength(message.len() as u64))
-                            .with_status(StatusCode::Ok)
-                            .with_body(message),
-                    ))
-                },
+        let responder = self.responder.clone();
+        let method = req.method().clone();
 
-                _ => Box::new(future::ok(
-                    Response::new().with_status(StatusCode::NotFound),
-                )),
-            }
-        } else {
-            Box::new(future::finished(
-                Response::new().with_status(StatusCode::Forbidden),
-            ))
-        }
+        Box::new(self.validate_request(req.body()).and_then(
+            move |check| if check {
+                match method {
+                    hyper::Method::Post => responder.respond(),
+                    _ => Box::new(future::ok(
+                        Response::new().with_status(StatusCode::NotFound),
+                    )),
+                }
+            } else {
+                Box::new(future::finished(
+                    Response::new().with_status(StatusCode::Forbidden),
+                ))
+            },
+        ))
     }
 }
 
 fn main() {
     let port_str = env::var("PORT").expect("Please set the PORT environment variable");
-    let addr = format!("0.0.0.0:{}", port_str).parse().expect(
+    let listen_addr = format!("0.0.0.0:{}", port_str).parse().expect(
         "Could not parse a listening address",
     );
+    let mut core = Core::new().expect("Cound not create new async engine");
+    let handle = core.handle();
+    let tokens_string = env::var("VALID_TOKENS").unwrap_or(String::new());
 
-    let server = Http::new()
-        .bind(&addr, || {
-            let uri = "http://inspirobot.me/api?generate=true".parse().expect(
-                "Could not parse inspirobot url",
-            );
-            let tokens_string = env::var("VALID_TOKENS").unwrap_or(String::new());
-            let valid_tokens = tokens_string.split(':').map(String::from).collect();
-            let core = Core::new().expect("Coud not create new tokio core");
-            let inspiration = Inspiration::new(core, uri, valid_tokens);
+    let listener = TcpListener::bind(&listen_addr, &handle).expect("Could not build tcp listener");
 
-            Ok(inspiration)
-        })
-        .unwrap();
+    let http = Http::new();
+    let server = listener.incoming().for_each(|(socket, addr)| {
+        let uri = "http://inspirobot.me/api?generate=true".parse().expect(
+            "Could not parse inspirobot url",
+        );
+        let valid_tokens = tokens_string.split(':').map(String::from).collect();
+        let responder = Responder::new(Muse::new(Client::new(&handle), uri));
+        let inspiration = Inspiration::new(responder, valid_tokens);
 
-    server.run().unwrap();
+        http.bind_connection(&handle, socket, addr, inspiration);
+        Ok(())
+    });
+
+    core.run(server).expect("something went terribly wrong with the server");
 }

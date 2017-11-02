@@ -24,16 +24,27 @@ use tokio_core::reactor::Core;
 use tokio_core::net::TcpListener;
 
 #[derive(Serialize, Deserialize)]
+struct Attachment {
+    text: String,
+    image_url: String,
+}
+
+#[derive(Serialize, Deserialize)]
 struct Message {
     response_type: &'static str,
-    text: String,
+    attachments: Vec<Attachment>,
 }
 
 impl Message {
     fn new(message: String) -> Self {
         Message {
-            response_type: "ephemeral",
-            text: message,
+            response_type: "in_channel",
+            attachments: vec![
+                Attachment {
+                    text: format!("from: {}", message),
+                    image_url: message,
+                },
+            ],
         }
     }
 }
@@ -58,8 +69,7 @@ impl Muse {
                 .get(self.uri.clone())
                 .and_then(|response| unchunk(response.body()))
                 .map(|string| {
-                    serde_json::to_string(&Message::new(string))
-                        .unwrap_or(String::new())
+                    serde_json::to_string(&Message::new(string)).unwrap_or(String::new())
                 }),
         )
     }

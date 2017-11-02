@@ -1,5 +1,6 @@
 extern crate futures;
 extern crate hyper;
+extern crate mime;
 extern crate regex;
 extern crate serde;
 extern crate serde_json;
@@ -14,12 +15,28 @@ use futures::{Future, Stream};
 use futures::future;
 use hyper::{Client, Uri};
 use hyper::client::HttpConnector;
-use hyper::header::ContentLength;
+use hyper::header::{ContentLength, ContentType};
 use hyper::StatusCode;
 use hyper::server::{Http, Request, Response, Service};
+use mime::APPLICATION_JSON;
 use regex::Regex;
 use tokio_core::reactor::Core;
 use tokio_core::net::TcpListener;
+
+#[derive(Serialize, Deserialize)]
+struct Message {
+    response_type: &'static str,
+    text: String,
+}
+
+impl Message {
+    fn new(message: String) -> Self {
+        Message {
+            response_type: "ephemeral",
+            text: message,
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Muse {
@@ -36,11 +53,15 @@ impl Muse {
     }
 
     fn inspire(&self) -> Box<Future<Item = String, Error = hyper::Error>> {
-        Box::new(self.http_client.get(self.uri.clone()).and_then(
-            |response| {
-                unchunk(response.body())
-            },
-        ))
+        Box::new(
+            self.http_client
+                .get(self.uri.clone())
+                .and_then(|response| unchunk(response.body()))
+                .map(|string| {
+                    serde_json::to_string(&Message::new(string))
+                        .unwrap_or(String::new())
+                }),
+        )
     }
 }
 
@@ -85,33 +106,13 @@ impl Responder {
     }
 
     fn respond(&self) -> Box<Future<Item = Response, Error = hyper::Error>> {
-        Box::new(
-            self.muse
-                .inspire()
-                .map(|message| {
-                    Response::new()
-                        .with_header(ContentLength(message.len() as u64))
-                        .with_status(StatusCode::Ok)
-                        .with_body(serde_json::to_string(&Message::new(message)).unwrap_or(
-                            String::new(),
-                        ))
-                }),
-        )
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Message {
-    response_type: &'static str,
-    text: String,
-}
-
-impl Message {
-    fn new(message: String) -> Self {
-        Message {
-            response_type: "ephemeral",
-            text: message,
-        }
+        Box::new(self.muse.inspire().map(|message| {
+            Response::new()
+                .with_header(ContentLength(message.len() as u64))
+                .with_header(ContentType(APPLICATION_JSON))
+                .with_status(StatusCode::Ok)
+                .with_body(message)
+        }))
     }
 }
 

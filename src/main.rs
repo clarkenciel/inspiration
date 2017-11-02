@@ -61,8 +61,7 @@ impl Inspiration {
     ) -> Box<Future<Item = bool, Error = hyper::Error>> {
         let valid_tokens = self.valid_tokens.clone();
         Box::new(unchunk(body).and_then(move |body_str| {
-            let re = Regex::new(r"token=(.*)&?").expect("Coud not compile token regexp");
-            println!("body string: {}", body_str);
+            let re = Regex::new(r"token=(\w+)&").expect("Coud not compile token regexp");
             let result = re.captures(&*body_str).and_then(|cap| cap.get(1)).map(|m| {
                 valid_tokens.iter().any(
                     |valid| valid.as_str() == m.as_str(),
